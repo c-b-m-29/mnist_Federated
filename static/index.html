@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Federated MNIST Client</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+</head>
+<body>
+    <h1>Federated MNIST Client</h1>
+    <button id="connect">Conectar al Servidor</button>
+    <button id="trainAndSend" disabled>Entrenar y Enviar Pesos</button>
+    <h2>Métricas del modelo</h2>
+    <ul id="metrics"></ul>
+    <h2>Prueba el modelo en vivo</h2>
+    <canvas id="canvas" width="140" height="140" style="border:1px solid #000; background:#fff"></canvas>
+    <br>
+    <button id="clear">Limpiar</button>
+    <button id="predict">Predecir</button>
+    <p id="prediction"></p>
+    <script>
+        console.log("=== FEDERATED MNIST CLIENT v1.0 ===");
+        let websocket, model, modelReady = false;
+
+        document.getElementById("connect").onclick = () => {
+            websocket = new WebSocket("ws://127.0.0.1:8000/ws");
+            websocket.onopen = () => console.log("Conectado al servidor");
+            websocket.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === "init_model") {
+                    model = tf.sequential();
+                    model.add(tf.layers.dense({units: 32, activation: 'relu', inputShape: [784]}));
+                    model.add(tf.layers.dense({units: 10, activation: 'softmax'}));
+                    model.compile({optimizer: 'sgd', loss: 'categoricalCrossentropy', metrics: ['accuracy']});
+                    console.log("Modelo en el cliente:");
+                    model.summary();
+                    const tensors = data.weights.map((arr, i) => {
+                        const shape = model.getWeights()[i].shape;
+                        if (shape.length === 2) {
+                            // Transponer para compatibilidad PyTorch <-> TF.js
+                            return tf.tensor(arr, [shape[1], shape[0]]).transpose();
+                        } else {
+                            return tf.tensor(arr, shape);
+                        }
+                    });
+                    model.setWeights(tensors);
+                    tensors.forEach(t => t.dispose());
+                    modelReady = true;
+                    document.getElementById("trainAndSend").disabled = false;
+                    console.log("Modelo inicializado y pesos cargados");
+                }
+                if (data.type === "global_update" && data.weights) {
+                    const tensors = data.weights.map((arr, i) => {
+                        const shape = model.getWeights()[i].shape;
+                        if (shape.length === 2) {
+                            return tf.tensor(arr, [shape[1], shape[0]]).transpose();
+                        } else {
+                            return tf.tensor(arr, shape);
+                        }
+                    });
+                    model.setWeights(tensors);
+                    tensors.forEach(t => t.dispose());
+                    if (data.metrics) {
+                        const metricsList = document.getElementById("metrics");
+                        metricsList.innerHTML = "";
+                        for (const [k, v] of Object.entries(data.metrics)) {
+                            metricsList.innerHTML += `<li>${k}: ${v}</li>`;
+                        }
+                    }
+                    console.log("Pesos globales recibidos y cargados");
+                }
+            };
+        };
+
+        document.getElementById("trainAndSend").onclick = async () => {
+            if (!modelReady) return;
+            // Simula datos: 100 muestras, 784 features
+            const xTrain = tf.randomNormal([100, 784]);
+            const yTrain = tf.oneHot(tf.randomUniform([100], 0, 10, 'int32'), 10);
+            await model.fit(xTrain, yTrain, {epochs: 1, batchSize: 32});
+            xTrain.dispose(); yTrain.dispose();
+            // Serializa y transpón los pesos antes de enviar
+            const weights = await Promise.all(model.getWeights().map(async (w, i) => {
+                const vals = Array.from(await w.data());
+                const shape = w.shape;
+                console.log("Serializando shape:", shape);
+                if (shape.length === 2) {
+                    // Transponer para PyTorch (out_features, in_features)
+                    const tfTensor = tf.tensor(vals, shape);
+                    const transposed = tf.transpose(tfTensor);
+                    // ¡Aquí está el cambio! Convierte a array 2D, no plano
+                    const arr2d = await transposed.array();
+                    tfTensor.dispose();
+                    transposed.dispose();
+                    return arr2d;
+                } else {
+                    return vals;
+                }
+            }));
+            websocket.send(JSON.stringify({type: "weights", weights: weights}));
+            console.log("Pesos entrenados y enviados al servidor");
+        };
+
+        // Dibujo en canvas
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let drawing = false;
+
+        canvas.addEventListener('mousedown', e => { drawing = true; });
+        canvas.addEventListener('mouseup', e => { drawing = false; ctx.beginPath(); });
+        canvas.addEventListener('mouseleave', e => { drawing = false; ctx.beginPath(); });
+        canvas.addEventListener('mousemove', draw);
+
+        function draw(e) {
+            if (!drawing) return;
+            ctx.lineWidth = 12;
+            ctx.lineCap = 'round';
+            ctx.strokeStyle = '#000';
+            ctx.lineTo(e.offsetX, e.offsetY);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(e.offsetX, e.offsetY);
+        }
+
+        document.getElementById('clear').onclick = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            document.getElementById('prediction').textContent = '';
+        };
+
+        // Predice la cifra dibujada en el lienzo
+        document.getElementById('predict').onclick = async () => {
+            // Preprocesar: escalar a 28x28, invertir color, normalizar [0,1]
+            const imgData = ctx.getImageData(0, 0, 140, 140);
+            // Convertir a escala de grises
+            let gray = [];
+            for (let i = 0; i < imgData.data.length; i += 4) {
+                // Promedio de R,G,B
+                const avg = (imgData.data[i] + imgData.data[i+1] + imgData.data[i+2]) / 3;
+                gray.push(255 - avg); // invertir: fondo blanco, trazo negro
+            }
+            // Convertir a tensor, redimensionar a 28x28
+            let imgTensor = tf.tensor(gray, [140, 140]);
+            imgTensor = tf.image.resizeBilinear(imgTensor.expandDims(-1), [28, 28]).squeeze();
+            imgTensor = imgTensor.div(255.0).reshape([1, 784]);
+            // Predecir
+            const pred = model.predict(imgTensor);
+            const predValue = pred.argMax(1).dataSync()[0];
+            document.getElementById('prediction').textContent = `Predicción: ${predValue}`;
+            imgTensor.dispose();
+            pred.dispose();
+        };
+    </script>
+</body>
+</html>
