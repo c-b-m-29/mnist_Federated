@@ -22,7 +22,7 @@
         let websocket, model, modelReady = false;
 
         document.getElementById("connect").onclick = () => {
-            websocket = new WebSocket("ws://127.0.0.1:8000/ws");
+            websocket = new WebSocket("wss://mnist-federated.onrender.com/ws");
             websocket.onopen = () => console.log("Conectado al servidor");
             websocket.onmessage = async (event) => {
                 const data = JSON.parse(event.data);
