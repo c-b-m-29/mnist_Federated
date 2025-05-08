@@ -82,3 +82,16 @@ async def federated_client(websocket: WebSocket):
         print("Desconexión:", e)
         if websocket in active_connections:
             active_connections.remove(websocket)
+
+@app.websocket("/ws/echo")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    while True:
+        data = await websocket.receive_text()
+        await websocket.send_text(f"Echo: {data}")
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
