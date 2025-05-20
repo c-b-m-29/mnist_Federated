@@ -4,6 +4,7 @@ import time
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from model import DenseModel
+from utils import serialize_model_weights, deserialize_model_weights, ConnectionManager
 
 app = FastAPI()
 app.add_middleware(
@@ -18,28 +19,12 @@ model = DenseModel()
 print("Modelo en el servidor:", model)
 global_weights = model.state_dict()
 client_weights_list = []
-active_connections = []
-
-# Serializar pesos para enviar al cliente (como lista de arrays)
-def serialize_model_weights(state_dict):
-    # Orden: fc1.weight, fc1.bias, fc2.weight, fc2.bias
-    return [
-        state_dict["fc1.weight"].cpu().numpy().tolist(),
-        state_dict["fc1.bias"].cpu().numpy().tolist(),
-        state_dict["fc2.weight"].cpu().numpy().tolist(),
-        state_dict["fc2.bias"].cpu().numpy().tolist(),
-    ]
-
-# Deserializar pesos recibidos del cliente (lista de arrays a state_dict)
-def deserialize_model_weights(weights):
-    keys = ["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"]
-    return {k: torch.tensor(w) for k, w in zip(keys, weights)}
+manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def federated_client(websocket: WebSocket):
-    global global_weights  # <-- Agrega esto
-    await websocket.accept()
-    active_connections.append(websocket)
+    global global_weights
+    await manager.connect(websocket)
     print("Cliente conectado")
     await websocket.send_text(json.dumps({
         "type": "init_model",
@@ -72,26 +57,27 @@ async def federated_client(websocket: WebSocket):
                     global_weights = averaged
                     client_weights_list.clear()
                     metrics = {"accuracy": round(torch.rand(1).item(), 3), "loss": round(torch.rand(1).item(), 3)}
-                    for conn in active_connections:
-                        await conn.send_text(json.dumps({
-                            "type": "global_update",
-                            "weights": serialize_model_weights(global_weights),
-                            "metrics": metrics
-                        }))
+                    await manager.broadcast({
+                        "type": "global_update",
+                        "weights": serialize_model_weights(global_weights),
+                        "metrics": metrics
+                    })
     except Exception as e:
         print("Desconexión:", e)
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        manager.disconnect(websocket)
 
 @app.websocket("/ws/echo")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        data = await websocket.receive_text()
-        await websocket.send_text(f"Echo: {data}")
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"Echo: {data}")
+    except Exception:
+        manager.disconnect(websocket)
 
 if __name__ == "__main__":
     import os
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
